@@ -1,0 +1,11 @@
+---
+BasedOnStyle: Google
+AlignAfterOpenBracket: AlwaysBreak
+BreakBeforeBraces: Allman
+ColumnLimit: "160"
+IndentWidth: "4"
+MaxEmptyLinesToKeep: "1"
+NamespaceIndentation: None
+
+BinPackArguments: false
+AlignConsecutiveAssignments: true
