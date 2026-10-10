@@ -1,3 +1,20 @@
-.pio
-.vscode
-managed_components
+# PlatformIO
+.pio/
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+
+# Сборка ESP-IDF напрямую (idf.py build)
+build/
+
+# Зависимости IDF Component Manager
+managed_components/
+
+# clangd
+.clangd/
+
+# VS Code: храним конфигурацию проекта, личные настройки и кэш — нет
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json

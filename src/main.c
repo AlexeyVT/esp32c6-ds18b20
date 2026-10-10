@@ -13,6 +13,8 @@
 
 static const char* TAG = "main.c";
 
+static uint32_t steering_attempts = 0;
+
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
     ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) == ESP_OK, , TAG, "Failed to start Zigbee commissioning");
@@ -32,25 +34,32 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* signal_struct)
             break;
         case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
         case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
-            if (err_status == ESP_OK)
-            {
-                if (esp_zb_bdb_is_factory_new())
-                {
-                    ESP_LOGI(TAG, "Start network steering");
-                    esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
-                }
+            ESP_LOGI(
+                TAG,
+                "%s, status: %s (%d), factory new: %d",
+                sig_type == ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START ? "Device first start" : "Device reboot",
+                esp_err_to_name(err_status),
+                err_status,
+                esp_zb_bdb_is_factory_new());
 
-                led_driver_set(0, 0, 0);
-            }
-            else
+            if (err_status != ESP_OK)
             {
-                /* commissioning failed */
-                ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)", esp_err_to_name(err_status));
-
+                steering_attempts++;
+                ESP_LOGW(TAG, "Cannot restore network, starting network steering (reconnect %lu)", steering_attempts);
+                esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
                 led_driver_set(0xFF, 0, 0);
-                vTaskDelay(pdMS_TO_TICKS(5000));
-                esp_restart();
+                break;
             }
+
+            steering_attempts = 0;
+
+            if (esp_zb_bdb_is_factory_new())
+            {
+                ESP_LOGI(TAG, "Start network steering");
+                esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+            }
+
+            led_driver_set(0, 0, 0);
             break;
         case ESP_ZB_BDB_SIGNAL_STEERING:
             if (err_status == ESP_OK)
@@ -59,9 +68,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* signal_struct)
                 esp_zb_get_extended_pan_id(extended_pan_id);
                 ESP_LOGI(
                     TAG,
-                    "Joined network successfully (Extended PAN ID: "
+                    "Network restored after %lu attempt(s) (Extended PAN ID: "
                     "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x, PAN ID: 0x%04hx, "
                     "Channel:%d, Short Address: 0x%04hx)",
+                    steering_attempts,
                     extended_pan_id[7],
                     extended_pan_id[6],
                     extended_pan_id[5],
@@ -73,11 +83,20 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* signal_struct)
                     esp_zb_get_pan_id(),
                     esp_zb_get_current_channel(),
                     esp_zb_get_short_address());
+                steering_attempts = 0;
+            }
+            else if (++steering_attempts <= 1)
+            {
+                ESP_LOGW(
+                    TAG,
+                    "Network steering failed: %s (%d). Check that the coordinator has permit-join open; retrying every 2 s",
+                    esp_err_to_name(err_status),
+                    err_status);
+                esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 2000);
             }
             else
             {
-                ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
-                esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+                esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 2000);
             }
             break;
         default:
@@ -146,6 +165,8 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 
 static void esp_zb_task(void* pvParameters)
 {
+    ESP_LOGI(TAG, "Initializing Zigbee stack, primary channel mask: 0x%08lx", (unsigned long)ESP_ZB_PRIMARY_CHANNEL_MASK);
+
     /* initialize Zigbee stack */
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
@@ -155,20 +176,24 @@ static void esp_zb_task(void* pvParameters)
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
+    ESP_LOGI(TAG, "Zigbee stack started, entering main loop");
     esp_zb_stack_main_loop();
 }
 
 void app_main(void)
 {
+    ESP_LOGI(TAG, "Application start: open-therm on %s", CONFIG_IDF_TARGET);
+
     led_driver_init();
+    ESP_ERROR_CHECK(nvs_flash_init());
     thermometer_init();
 
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config  = ESP_ZB_DEFAULT_HOST_CONFIG(),
     };
-    ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
 
+    ESP_LOGI(TAG, "Starting Zigbee task");
     xTaskCreate(esp_zb_task, "Zigbee_main", 8192, NULL, 5, NULL);
 }

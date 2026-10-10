@@ -22,11 +22,11 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.0
+    version: 6.1.0
 direct_dependencies:
 - espressif/esp-zboss-lib
 - espressif/esp-zigbee-lib
 - idf
 manifest_hash: d415c30363b8669d538c20faf905530a6229d552c26567ee2587a0cb667a06ca
 target: esp32c6
-version: 2.0.0
+version: 3.0.0

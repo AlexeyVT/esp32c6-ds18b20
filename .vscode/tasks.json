@@ -1,0 +1,49 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "PIO: Flash (upload)",
+      "type": "shell",
+      "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+      "args": ["run", "-t", "upload"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      // Монитор порта на 115200 с декодером исключений из platformio.ini
+      "label": "PIO: Monitor",
+      "type": "shell",
+      "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+      "args": ["device", "monitor", "--raw"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      // Прошить и сразу открыть монитор
+      "label": "PIO: Upload and Monitor",
+      "type": "shell",
+      "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+      "args": ["run", "-t", "upload", "-t", "monitor", "--raw"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    }
+  ]
+}
