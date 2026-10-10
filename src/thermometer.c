@@ -47,6 +47,7 @@ static ds18b20_dev_t ds18b20_dev = {
 
 static thermometer_list_t thermometer_list               = {0};
 static esp_zb_user_cb_handle_t temperature_update_handle = 0;
+static uint8_t reporting_rounds                          = 0;
 
 static void thermometer_addr_to_string(const uint8_t *addr, char *buffer, size_t size)
 {
@@ -121,19 +122,25 @@ static void thermometer_list_save(const thermometer_list_t *list)
         return;
     }
 
+    esp_err_t status = nvs_erase_all(handle);
+    if (status != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to clear endpoint registry, status: %s", esp_err_to_name(status));
+    }
+
     for (uint8_t i = 0; i < list->count; i++)
     {
         char key[8];
         thermometer_nvs_key(list->ds18b20[i].endpoint, key, sizeof(key));
 
-        esp_err_t status = nvs_set_blob(handle, key, list->ds18b20[i].addr, sizeof(ds18b20_phy_addr_t));
+        status = nvs_set_blob(handle, key, list->ds18b20[i].addr, sizeof(ds18b20_phy_addr_t));
         if (status != ESP_OK)
         {
             ESP_LOGW(TAG, "Failed to store endpoint %d, status: %s", list->ds18b20[i].endpoint, esp_err_to_name(status));
         }
     }
 
-    esp_err_t status = nvs_commit(handle);
+    status = nvs_commit(handle);
     if (status != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to commit endpoint registry, status: %s", esp_err_to_name(status));
@@ -158,6 +165,27 @@ static void thermometer_list_seed(thermometer_list_t *list, ds18b20_phy_addr_t *
     list->count = scan_count;
 }
 
+#if DS18B20_FAKE_SENSORS
+_Static_assert(DS18B20_FAKE_SENSORS <= DS18B20_MAX_DEVICES, "DS18B20_FAKE_SENSORS exceeds the endpoint registry size");
+
+static void thermometer_list_seed_fake(thermometer_list_t *list)
+{
+    memset(list, 0, sizeof(thermometer_list_t));
+
+    for (uint8_t i = 0; i < DS18B20_FAKE_SENSORS; i++)
+    {
+        ds18b20_t *sensor = &list->ds18b20[i];
+
+        sensor->addr[0]  = 0xFA;
+        sensor->addr[1]  = i + 1;
+        sensor->endpoint = DS18B20_FIRST_ENDPOINT + i;
+        sensor->value    = (int16_t)DS18B20_TEMPERATURE_UNKNOWN;
+    }
+
+    list->count = DS18B20_FAKE_SENSORS;
+}
+#endif
+
 static uint8_t thermometer_free_endpoint(const thermometer_list_t *list)
 {
     for (uint8_t endpoint = DS18B20_FIRST_ENDPOINT; endpoint < DS18B20_FIRST_ENDPOINT + DS18B20_MAX_DEVICES; endpoint++)
@@ -180,66 +208,35 @@ static uint8_t thermometer_free_endpoint(const thermometer_list_t *list)
 
 static bool thermometer_list_reconcile(thermometer_list_t *list, ds18b20_phy_addr_t *scan, uint8_t scan_count)
 {
-    bool found[DS18B20_MAX_DEVICES]  = {false};
-    bool absent[DS18B20_MAX_DEVICES] = {false};
-    uint8_t absent_count             = 0;
-    uint8_t new_count                = 0;
-    bool changed                     = false;
+    bool found[DS18B20_MAX_DEVICES] = {false};
+    bool changed                    = false;
+    uint8_t kept                    = 0;
+
+    qsort(scan, scan_count, sizeof(ds18b20_phy_addr_t), ds18b20_compare_addr);
 
     for (uint8_t i = 0; i < list->count; i++)
     {
         int index = thermometer_addr_index(scan, scan_count, list->ds18b20[i].addr);
 
-        if (index >= 0)
+        if (index < 0)
         {
-            found[index] = true;
+            char addr[20];
+            thermometer_addr_to_string(list->ds18b20[i].addr, addr, sizeof(addr));
+            ESP_LOGI(TAG, "Forgetting DS18B20 device %s of endpoint %d", addr, list->ds18b20[i].endpoint);
+            changed = true;
+            continue;
         }
-        else
+
+        found[index] = true;
+
+        if (kept != i)
         {
-            absent[i] = true;
-            absent_count++;
+            list->ds18b20[kept] = list->ds18b20[i];
         }
+        kept++;
     }
 
-    for (uint8_t i = 0; i < scan_count; i++)
-    {
-        if (!found[i])
-        {
-            new_count++;
-        }
-    }
-
-    if (absent_count == 1 && new_count == 1)
-    {
-        for (uint8_t i = 0; i < list->count; i++)
-        {
-            if (!absent[i])
-            {
-                continue;
-            }
-
-            for (uint8_t j = 0; j < scan_count; j++)
-            {
-                if (found[j])
-                {
-                    continue;
-                }
-
-                char old_addr[20];
-                char new_addr[20];
-
-                thermometer_addr_to_string(list->ds18b20[i].addr, old_addr, sizeof(old_addr));
-                thermometer_addr_to_string(scan[j], new_addr, sizeof(new_addr));
-                ESP_LOGI(TAG, "Replacing DS18B20 device %s with %s on endpoint %d", old_addr, new_addr, list->ds18b20[i].endpoint);
-
-                memcpy(list->ds18b20[i].addr, scan[j], sizeof(ds18b20_phy_addr_t));
-                list->ds18b20[i].value = (int16_t)DS18B20_TEMPERATURE_UNKNOWN;
-                break;
-            }
-        }
-
-        return true;
-    }
+    list->count = kept;
 
     for (uint8_t j = 0; j < scan_count; j++)
     {
@@ -259,6 +256,7 @@ static bool thermometer_list_reconcile(thermometer_list_t *list, ds18b20_phy_add
 
         ds18b20_t *sensor = &list->ds18b20[list->count];
 
+        memset(sensor, 0, sizeof(ds18b20_t));
         memcpy(sensor->addr, scan[j], sizeof(ds18b20_phy_addr_t));
         sensor->endpoint = thermometer_free_endpoint(list);
         sensor->value    = (int16_t)DS18B20_TEMPERATURE_UNKNOWN;
@@ -305,9 +303,21 @@ static uint8_t thermometer_scan(ds18b20_phy_addr_t *scan)
     return count;
 }
 
+static bool thermometer_has_unknown(void)
+{
+    for (uint8_t i = 0; i < thermometer_list.count; i++)
+    {
+        if (thermometer_list.ds18b20[i].value == (int16_t)DS18B20_TEMPERATURE_UNKNOWN)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void set_temperature_unknown(uint8_t ep)
 {
-    led_driver_set(0, 0xFF, 0xFF);
     ESP_LOGW(TAG, "Setting temperature to unknown for endpoint %d", ep);
     esp_zb_zcl_set_attribute_val(
         ep,
@@ -318,10 +328,23 @@ void set_temperature_unknown(uint8_t ep)
         false);
 }
 
+#if DS18B20_FAKE_SENSORS
+static int32_t thermometer_fake_raw(uint8_t index)
+{
+    static uint8_t step[DS18B20_FAKE_SENSORS] = {0};
+    // A 0.5 °C ramp over a 25 °C base shifted by 5 °C per sensor, values are in 2^-7 °C units (3200 = 25.00 °C)
+    static const int32_t offsets[] = {0, 64, 128, 64};
+
+    return 3200 + (int32_t)index * 640 + offsets[step[index]++ % (sizeof(offsets) / sizeof(offsets[0]))];
+}
+#endif
+
 void thermometer_update_values(void)
 {
     led_driver_set(0, 0xFF, 0);
+#if !DS18B20_FAKE_SENSORS
     ds18b20_requestTemperatures(&ds18b20_dev);
+#endif
     led_driver_set(0, 0, 0);
 
     for (uint8_t i = 0; i < thermometer_list.count; i++)
@@ -329,7 +352,11 @@ void thermometer_update_values(void)
         ds18b20_t *ds18b20 = &thermometer_list.ds18b20[i];
         uint8_t ep         = ds18b20->endpoint;
 
+#if DS18B20_FAKE_SENSORS
+        int32_t raw = thermometer_fake_raw(i);
+#else
         int32_t raw = ds18b20_getTemp(&ds18b20_dev, ds18b20->addr);
+#endif
         if (raw == DEVICE_DISCONNECTED_RAW || raw == 0)
         {
             ESP_LOGW(TAG, "Failed to read temperature for endpoint %d", ep);
@@ -339,7 +366,7 @@ void thermometer_update_values(void)
                 ds18b20->read_attempts++;
             }
 
-            if (ds18b20->read_attempts == DS18B20_READ_FAILURE_ATTEMPTS + 1)
+            if (ds18b20->read_attempts > DS18B20_READ_FAILURE_ATTEMPTS && ds18b20->value != (int16_t)DS18B20_TEMPERATURE_UNKNOWN)
             {
                 ds18b20->value = (int16_t)DS18B20_TEMPERATURE_UNKNOWN;
                 set_temperature_unknown(ep);
@@ -351,7 +378,7 @@ void thermometer_update_values(void)
 
         int16_t new_value = (int16_t)((float)raw * 0.78125f);
 
-        if (abs(ds18b20->value - new_value) < 10)
+        if (abs(ds18b20->value - new_value) < DS18B20_SIGNIFICANT_CHANGE)
         {
             ds18b20->skip_unchanged_updates++;
             if (ds18b20->skip_unchanged_updates > DS18B20_SKIP_UNCHANGED_UPDATE)
@@ -382,6 +409,11 @@ void thermometer_update_values(void)
             ESP_LOGI(TAG, "Updated temperature for endpoint %d: %i.%02i°C", ep, ds18b20->value / 100, ds18b20->value % 100);
         }
     }
+
+    if (thermometer_has_unknown())
+    {
+        led_driver_set(0xFF, 0, 0xFF);
+    }
 }
 
 static void temperature_update_callback(void *param)
@@ -390,11 +422,11 @@ static void temperature_update_callback(void *param)
     temperature_update_handle = esp_zb_scheduler_user_alarm(temperature_update_callback, NULL, DS18B20_UPDATE_INTERVAL);
 }
 
-void thermometer_add_endpoints(void)
+bool thermometer_add_endpoints(void)
 {
     if (thermometer_list.count == 0)
     {
-        return;
+        return false;
     }
 
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
@@ -423,6 +455,169 @@ void thermometer_add_endpoints(void)
     esp_zb_device_register(ep_list);
 
     temperature_update_handle = esp_zb_scheduler_user_alarm(temperature_update_callback, NULL, DS18B20_UPDATE_INTERVAL);
+
+    return true;
+}
+
+static bool thermometer_reporting_configure(uint8_t endpoint)
+{
+    esp_zb_zcl_reporting_info_t reporting_info = {
+        .direction    = ESP_ZB_ZCL_REPORT_DIRECTION_SEND,
+        .ep           = endpoint,
+        .cluster_id   = ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+        .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        .attr_id      = ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+        .u.send_info =
+            {
+                .min_interval     = DS18B20_REPORT_MIN_INTERVAL,
+                .max_interval     = DS18B20_REPORT_MAX_INTERVAL,
+                .delta.s16        = DS18B20_SIGNIFICANT_CHANGE,
+                .def_min_interval = DS18B20_REPORT_MIN_INTERVAL,
+                .def_max_interval = DS18B20_REPORT_MAX_INTERVAL,
+            },
+        .dst =
+            {
+                .short_addr = DS18B20_COORDINATOR_SHORT_ADDRESS,
+                .endpoint   = DS18B20_COORDINATOR_ENDPOINT,
+                .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+            },
+        .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+    };
+    esp_zb_zcl_attr_location_info_t attr_info = {
+        .endpoint_id  = endpoint,
+        .cluster_id   = ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+        .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        .manuf_code   = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+        .attr_id      = ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+    };
+
+    esp_err_t status = esp_zb_zcl_update_reporting_info(&reporting_info);
+    if (status != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to configure reporting for endpoint %d, status: %s", endpoint, esp_err_to_name(status));
+        return false;
+    }
+
+    esp_zb_zcl_reporting_info_t* stored = esp_zb_zcl_find_reporting_info(attr_info);
+    if (stored == NULL)
+    {
+        ESP_LOGW(TAG, "Reporting entry for endpoint %d was not stored", endpoint);
+        return false;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Reporting for endpoint %d: destination(0x%04x/%d), min(%d s), max(%d s), delta(%d)",
+        endpoint,
+        stored->dst.short_addr,
+        stored->dst.endpoint,
+        stored->u.send_info.min_interval,
+        stored->u.send_info.max_interval,
+        stored->u.send_info.delta.s16);
+
+    return true;
+}
+
+typedef struct
+{
+    esp_zb_zdo_bind_req_param_t req;
+    uint8_t endpoint;
+} thermometer_bind_ctx_t;
+
+static void thermometer_bind_callback(esp_zb_zdp_status_t zdo_status, void* user_ctx)
+{
+    thermometer_bind_ctx_t* ctx = user_ctx;
+
+    if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS)
+    {
+        ESP_LOGW(TAG, "Failed to bind endpoint %d to the coordinator, status: %d", ctx->endpoint, zdo_status);
+    }
+
+    free(ctx);
+}
+
+static bool thermometer_bind_coordinator(uint8_t endpoint)
+{
+    thermometer_bind_ctx_t* ctx = calloc(1, sizeof(thermometer_bind_ctx_t));
+
+    if (ctx == NULL)
+    {
+        return false;
+    }
+
+    ctx->endpoint          = endpoint;
+    ctx->req.src_endp      = endpoint;
+    ctx->req.cluster_id    = ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT;
+    ctx->req.dst_addr_mode = ESP_ZB_ZDO_BIND_DST_ADDR_MODE_64_BIT_EXTENDED;
+    ctx->req.dst_endp      = DS18B20_COORDINATOR_ENDPOINT;
+    ctx->req.req_dst_addr  = esp_zb_get_short_address();
+
+    esp_zb_get_long_address(ctx->req.src_address);
+
+    if (esp_zb_ieee_address_by_short(DS18B20_COORDINATOR_SHORT_ADDRESS, ctx->req.dst_address_u.addr_long) != ESP_OK)
+    {
+        free(ctx);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Binding endpoint %d to the coordinator", endpoint);
+    esp_zb_zdo_device_bind_req(&ctx->req, thermometer_bind_callback, ctx);
+
+    return true;
+}
+
+static void thermometer_reporting_retry(uint8_t param);
+
+static void thermometer_reporting_setup(void)
+{
+    bool bound      = thermometer_list.count > 0;
+    bool configured = bound;
+
+    for (uint8_t i = 0; i < thermometer_list.count; i++)
+    {
+        uint8_t endpoint = thermometer_list.ds18b20[i].endpoint;
+
+        bound      = thermometer_bind_coordinator(endpoint) && bound;
+        configured = thermometer_reporting_configure(endpoint) && configured;
+    }
+
+    if (bound && configured)
+    {
+        return;
+    }
+
+    if (++reporting_rounds > DS18B20_REPORT_RETRY_ATTEMPTS)
+    {
+        ESP_LOGW(TAG, "Reporting is not set up, values will not be reported");
+        return;
+    }
+
+    if (bound)
+    {
+        // Stale entries left by earlier attempts keep the slot busy, so they are dropped before retrying
+        ESP_LOGW(TAG, "Wiping reporting entries and retrying (%d)", reporting_rounds);
+        esp_zb_zcl_reset_all_reporting_info();
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Coordinator address is not known yet, retrying (%d)", reporting_rounds);
+    }
+
+    esp_zb_scheduler_alarm((esp_zb_callback_t)thermometer_reporting_retry, 0, DS18B20_REPORT_RETRY_INTERVAL);
+}
+
+static void thermometer_reporting_retry(uint8_t param)
+{
+    (void)param;
+
+    thermometer_reporting_setup();
+}
+
+void thermometer_reporting_start(void)
+{
+    reporting_rounds = 0;
+
+    thermometer_reporting_setup();
 }
 
 void thermometer_init(void)
@@ -433,6 +628,16 @@ void thermometer_init(void)
     uint8_t scan_count = thermometer_scan(scan);
 
     thermometer_list_load(&thermometer_list);
+
+#if DS18B20_FAKE_SENSORS
+    thermometer_list_seed_fake(&thermometer_list);
+    ESP_LOGW(
+        TAG,
+        "Fake DS18B20 devices are registered on endpoints %d-%d, the 1-wire bus is ignored",
+        DS18B20_FIRST_ENDPOINT,
+        DS18B20_FIRST_ENDPOINT + DS18B20_FAKE_SENSORS - 1);
+    return;
+#endif
 
     if (thermometer_list.count == 0)
     {

@@ -58,6 +58,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* signal_struct)
                 ESP_LOGI(TAG, "Start network steering");
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
             }
+            else
+            {
+                thermometer_reporting_start();
+            }
 
             led_driver_set(0, 0, 0);
             break;
@@ -84,6 +88,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* signal_struct)
                     esp_zb_get_current_channel(),
                     esp_zb_get_short_address());
                 steering_attempts = 0;
+                thermometer_reporting_start();
             }
             else if (++steering_attempts <= 1)
             {
@@ -171,7 +176,12 @@ static void esp_zb_task(void* pvParameters)
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
 
-    thermometer_add_endpoints();
+    if (!thermometer_add_endpoints())
+    {
+        ESP_LOGE(TAG, "No DS18B20 endpoint to register, Zigbee stack is not started");
+        vTaskDelete(NULL);
+        return;
+    }
 
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);

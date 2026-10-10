@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_zigbee_core.h"
@@ -9,8 +10,9 @@ extern "C"
 {
 #endif
 
-    void thermometer_add_endpoints();
+    bool thermometer_add_endpoints(void);
     void thermometer_init(void);
+    void thermometer_reporting_start(void);
     void thermometer_update_values(void);
 
 #ifdef __cplusplus
